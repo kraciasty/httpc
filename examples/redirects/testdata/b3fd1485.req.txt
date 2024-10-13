@@ -1,0 +1,4 @@
+GET / HTTP/0.0
+Host: www.google.com
+Referer: http://google.com
+
