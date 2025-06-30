@@ -4,14 +4,53 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/kraciasty/httpc"
 	"github.com/kraciasty/httpc/internal/httpctest"
 )
+
+type delayedReader struct {
+	ctx    context.Context
+	delay  time.Duration
+	data   []byte
+	offset int
+}
+
+func (s *delayedReader) Read(p []byte) (n int, err error) {
+	if s.offset >= len(s.data) {
+		return 0, io.EOF
+	}
+
+	if s.offset == 0 {
+		t := time.NewTimer(s.delay)
+		defer t.Stop()
+		select {
+		case <-s.ctx.Done():
+			if !t.Stop() {
+				<-t.C
+			}
+			return 0, s.ctx.Err()
+		case <-t.C:
+		}
+	}
+
+	n = copy(p, s.data[s.offset:])
+	s.offset += n
+	if s.offset >= len(s.data) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (s *delayedReader) Close() error {
+	return nil
+}
 
 var stubResponse = []byte(`HTTP/1.1 200 OK
 
@@ -71,73 +110,129 @@ func TestRecover(t *testing.T) {
 }
 
 func TestTimeout(t *testing.T) {
-	// timeoutHandler is a custom test handler that introduces an artificial delay.
-	timeoutHandler := func(delay time.Duration) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			<-time.After(delay)
-			w.WriteHeader(http.StatusOK)
-		})
-	}
-
 	tests := []struct {
-		name    string
-		delay   time.Duration
-		timeout time.Duration
-		err     error
+		name          string
+		timeout       time.Duration
+		wantTimeout   bool
+		serverHandler httpc.DoerFunc
+		expectBodyErr bool
 	}{
 		{
-			name:    "without timeout",
-			delay:   0,
+			name:    "no timeout",
 			timeout: 0,
+			serverHandler: func(r *http.Request) (*http.Response, error) {
+				return httpctest.ReplayBytes(stubResponse)(r)
+			},
+			expectBodyErr: false,
 		},
 		{
-			name:    "deadline exceeded",
-			delay:   time.Hour,
-			timeout: 1,
-			err:     context.DeadlineExceeded,
+			name:    "immediate response",
+			timeout: 10 * time.Second,
+			serverHandler: func(r *http.Request) (*http.Response, error) {
+				return httpctest.ReplayBytes(stubResponse)(r)
+			},
+			expectBodyErr: false,
+		},
+		{
+			name:        "deadline exceeded",
+			timeout:     5 * time.Second,
+			wantTimeout: true,
+			serverHandler: func(r *http.Request) (*http.Response, error) {
+				select {
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				case <-time.After(10 * time.Second):
+					return httpctest.ReplayBytes(stubResponse)(r)
+				}
+			},
 		},
 		{
 			name:    "within timeout",
-			delay:   0,
-			timeout: time.Hour,
+			timeout: 10 * time.Second,
+			serverHandler: func(r *http.Request) (*http.Response, error) {
+				select {
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				case <-time.After(5 * time.Second):
+					return httpctest.ReplayBytes(stubResponse)(r)
+				}
+			},
+			expectBodyErr: false,
+		},
+		{
+			name:    "delayed body read within timeout",
+			timeout: 10 * time.Second,
+			serverHandler: func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: &delayedReader{
+						ctx:   r.Context(),
+						delay: 3 * time.Second,
+						data:  []byte("Some stubbed stuff."),
+					},
+				}, nil
+			},
+			expectBodyErr: false,
+		},
+		{
+			name:        "delayed body read exceeding timeout",
+			timeout:     10 * time.Second,
+			wantTimeout: false,
+			serverHandler: func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: &delayedReader{
+						ctx:   r.Context(),
+						delay: 15 * time.Second,
+						data:  []byte("Some stubbed stuff."),
+					},
+				}, nil
+			},
+			expectBodyErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := setupServer(t, timeoutHandler(tt.delay))
-			mw := httpc.Timeout(tt.timeout)
-			req, err := http.NewRequest(http.MethodGet, srv.URL, http.NoBody)
-			if err != nil {
-				t.Fatalf("Cannot create request: %v", err)
-			}
+			synctest.Run(func() {
+				client := httpc.NewClient(tt.serverHandler, httpc.Timeout(tt.timeout))
+				req, err := http.NewRequest(http.MethodGet, "http://localhost", http.NoBody)
+				if err != nil {
+					t.Fatalf("Cannot create request: %v", err)
+				}
 
-			start := time.Now()
-			client := httpc.NewClient(srv.Client(), mw)
-			resp, err := client.Do(req)
-			if err != nil {
-				if tt.err != nil {
-					if !errors.Is(err, tt.err) {
-						t.Fatalf("Expected an error but got: %v", err)
+				resp, err := client.Do(req)
+				if err == nil {
+					defer resp.Body.Close()
+				}
+
+				if tt.wantTimeout {
+					if !errors.Is(err, context.DeadlineExceeded) {
+						t.Errorf("Expected context.DeadlineExceeded error, got: %v", err)
 					}
 					return
 				}
 
-				t.Fatalf("Received unexpected error: %v", err)
-			}
-			defer resp.Body.Close()
-
-			if tt.err != nil {
-				t.Fatalf("Expected an error but got nil")
-				return
-			}
-
-			if tt.timeout > 0 {
-				duration := time.Since(start)
-				if duration >= tt.timeout {
-					t.Fatalf("Request took %v, exceeded the timeout of %v", duration, tt.timeout)
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
 				}
-			}
+
+				data, err := io.ReadAll(resp.Body)
+				if tt.expectBodyErr {
+					if !errors.Is(err, context.DeadlineExceeded) {
+						t.Errorf("Expected context.DeadlineExceeded error, got: %v", err)
+					}
+					return
+				}
+
+				if err != nil {
+					t.Fatalf("Failed to read response body: %v", err)
+				}
+
+				if len(data) == 0 {
+					t.Errorf("Expected a response body")
+				}
+			})
 		})
 	}
 }

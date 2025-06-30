@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -92,18 +93,25 @@ func Secure() MiddlewareFunc {
 // Timeout adds a timeout to the client requests.
 //
 // The middleware is not applied if the timeout is below or equal to zero.
-func Timeout(d time.Duration) MiddlewareFunc {
-	if d <= 0 {
-		return nil
-	}
-
+// The context is only canceled after the response body is fully read/closed.
+func Timeout(timeout time.Duration) MiddlewareFunc {
 	return func(next DoerFunc) DoerFunc {
-		return func(r *http.Request) (*http.Response, error) {
-			ctx, cancel := context.WithTimeout(r.Context(), d)
-			defer cancel()
+		return func(req *http.Request) (*http.Response, error) {
+			ctx, cancel := context.WithTimeout(req.Context(), timeout)
+			req = req.WithContext(ctx)
 
-			r = r.WithContext(ctx)
-			return next(r)
+			resp, err := next.RoundTrip(req)
+			if err != nil {
+				cancel()
+				return nil, err
+			}
+
+			resp.Body = &timeoutBody{
+				ReadCloser: resp.Body,
+				cancel:     cancel,
+			}
+
+			return resp, nil
 		}
 	}
 }
@@ -183,4 +191,23 @@ func SetHeader(k, v string) MiddlewareFunc {
 			return next(r)
 		})
 	}
+}
+
+type timeoutBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *timeoutBody) Read(p []byte) (n int, err error) {
+	n, err = b.ReadCloser.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.cancel()
+	}
+	return n, err
+}
+
+func (b *timeoutBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
